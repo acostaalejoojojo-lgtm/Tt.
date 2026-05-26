@@ -1,6 +1,6 @@
 import React, { useRef, useState, useEffect, Suspense } from 'react';
 import { Canvas, useFrame, useLoader } from '@react-three/fiber';
-import { OrbitControls, PerspectiveCamera, ContactShadows, Environment, useGLTF, Text, useTexture } from '@react-three/drei';
+import { OrbitControls, PerspectiveCamera, ContactShadows, Environment, useGLTF, useAnimations, Text, useTexture } from '@react-three/drei';
 import * as THREE from 'three';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { AnimatedAvatar } from './AnimatedAvatar';
@@ -52,15 +52,39 @@ const AccessoryModel = ({ url, position, scale }: { url: string; position: any; 
 // --- CUSTOM FULL AVATAR MODEL ---
 
 const CustomModelFBXLoader = ({ url }: { url: string }) => {
+  const group = useRef<THREE.Group>(null);
   const fbx = useLoader(FBXLoader, url);
-  const clone = React.useMemo(() => fbx.clone(), [fbx]);
-  return <primitive object={clone} scale={0.01} />;
+  const clone = React.useMemo(() => fbx.clone(true), [fbx]);
+  const { actions, names } = useAnimations(clone.animations || [], group);
+
+  useEffect(() => {
+    if (names.length > 0 && actions[names[0]]) {
+      actions[names[0]]!.reset().fadeIn(0.3).play();
+    }
+    return () => {
+      Object.values(actions).forEach(a => a?.fadeOut(0.3));
+    };
+  }, [actions, names]);
+
+  return <group ref={group}><primitive object={clone} scale={0.01} /></group>;
 };
 
 const CustomModelGLTFLoader = ({ url }: { url: string }) => {
-  const { scene } = useGLTF(url);
-  const clone = React.useMemo(() => scene.clone(), [scene]);
-  return <primitive object={clone} />;
+  const group = useRef<THREE.Group>(null);
+  const { scene, animations } = useGLTF(url);
+  const clone = React.useMemo(() => scene.clone(true), [scene]);
+  const { actions, names } = useAnimations(animations, group);
+
+  useEffect(() => {
+    if (names.length > 0 && actions[names[0]]) {
+      actions[names[0]]!.reset().fadeIn(0.3).play();
+    }
+    return () => {
+      Object.values(actions).forEach(a => a?.fadeOut(0.3));
+    };
+  }, [actions, names]);
+
+  return <group ref={group}><primitive object={clone} /></group>;
 };
 
 const CustomModelRenderer = ({ url }: { url: string }) => {
