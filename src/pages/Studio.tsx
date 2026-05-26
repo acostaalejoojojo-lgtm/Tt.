@@ -13,7 +13,7 @@ import { auth, db, handleFirestoreError, OperationType } from '../firebase';
 import { doc, getDoc, setDoc, updateDoc, onSnapshot, collection, query, where, orderBy, getDocs } from 'firebase/firestore';
 import { onAuthStateChanged } from 'firebase/auth';
 import { ImportedModel, CustomAvatarSwitcher } from '../components/ModelLoaders';
-import { VoxelCharacter } from '../components/AvatarScene';
+import { VoxelCharacter, PlayerCharacter } from '../components/AvatarScene';
 import ErrorBoundary from '../components/ErrorBoundary';
 import { dataService } from '../lib/dataService';
 import { playFab } from '../lib/playfab';
@@ -1402,7 +1402,7 @@ const PlayerController: React.FC<PlayerControllerProps> = ({
                         )}
                     </group>
                 ) : (
-                    <VoxelCharacter 
+                    <PlayerCharacter 
                         config={avatarConfig} 
                         position={[pos.x, pos.y, pos.z]} 
                         rotation={[rot.x, rot.y, rot.z]} 

@@ -796,6 +796,18 @@ export const AvatarEditor: React.FC<AvatarEditorProps> = ({ currentConfig, onUpd
                     </div>
                     <input type="file" accept=".glb,.gltf,.fbx" className="hidden" onChange={(e) => handleFileUpload(e, 'customModel')} />
                 </label>
+
+                {currentConfig.customModelUrl && (
+                  <div className="mt-4 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <div className="w-2 h-2 rounded-full bg-green-400"></div>
+                      <span className="text-[10px] font-bold text-green-400 uppercase tracking-widest">Avatar Personalizado Activo</span>
+                    </div>
+                    <div className="rounded-xl overflow-hidden border border-white/10" style={{ height: 220 }}>
+                      <AvatarScene config={currentConfig} interactive={false} />
+                    </div>
+                  </div>
+                )}
                 
                 <div className="mt-4 flex gap-2">
                    <button 

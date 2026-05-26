@@ -49,6 +49,41 @@ const AccessoryModel = ({ url, position, scale }: { url: string; position: any; 
   return <AccessoryGLTF url={cleanUrl} position={position} scale={scale} />;
 };
 
+// --- CUSTOM FULL AVATAR MODEL ---
+
+const CustomModelFBXLoader = ({ url }: { url: string }) => {
+  const fbx = useLoader(FBXLoader, url);
+  const clone = React.useMemo(() => fbx.clone(), [fbx]);
+  return <primitive object={clone} scale={0.01} />;
+};
+
+const CustomModelGLTFLoader = ({ url }: { url: string }) => {
+  const { scene } = useGLTF(url);
+  const clone = React.useMemo(() => scene.clone(), [scene]);
+  return <primitive object={clone} />;
+};
+
+const CustomModelRenderer = ({ url }: { url: string }) => {
+  const isFbx = url.includes('#fbx') || url.toLowerCase().endsWith('.fbx');
+  const cleanUrl = url.replace('#fbx', '');
+  if (isFbx) {
+    return (
+      <ErrorBoundary fallback={null}>
+        <Suspense fallback={null}>
+          <CustomModelFBXLoader url={cleanUrl} />
+        </Suspense>
+      </ErrorBoundary>
+    );
+  }
+  return (
+    <ErrorBoundary fallback={null}>
+      <Suspense fallback={null}>
+        <CustomModelGLTFLoader url={cleanUrl} />
+      </Suspense>
+    </ErrorBoundary>
+  );
+};
+
 // --- HEAD COMPONENTS ---
 
 const TexturedHead = ({ url, materialProps }: { url: string; materialProps: any }) => {
@@ -526,7 +561,9 @@ export const AvatarScene: React.FC<AvatarSceneProps & { isLobby?: boolean }> = (
         <group position={[0, -0.5, 0]}>
             <ErrorBoundary fallback={<mesh><boxGeometry args={[1,1,1]} /><meshStandardMaterial color="red" wireframe /></mesh>}>
                 <React.Suspense fallback={null}>
-                    {activeConfig.base !== 'default' || activeConfig.animations?.idle ? (
+                    {activeConfig.customModelUrl ? (
+                        <CustomModelRenderer url={activeConfig.customModelUrl} />
+                    ) : activeConfig.base !== 'default' || activeConfig.animations?.idle ? (
                         <AnimatedAvatar 
                            config={activeConfig}
                            name={username}
@@ -555,4 +592,15 @@ export const AvatarScene: React.FC<AvatarSceneProps & { isLobby?: boolean }> = (
       </Canvas>
     </div>
   );
+};
+
+export const PlayerCharacter: React.FC<CharacterProps> = (props) => {
+  if (props.config?.customModelUrl) {
+    return (
+      <group position={props.position || [0, 0, 0]} rotation={props.rotation || [0, 0, 0]}>
+        <CustomModelRenderer url={props.config.customModelUrl} />
+      </group>
+    );
+  }
+  return <VoxelCharacter {...props} />;
 };
