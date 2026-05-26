@@ -54,37 +54,34 @@ const AccessoryModel = ({ url, position, scale }: { url: string; position: any; 
 const CustomModelFBXLoader = ({ url }: { url: string }) => {
   const group = useRef<THREE.Group>(null);
   const fbx = useLoader(FBXLoader, url);
-  const clone = React.useMemo(() => fbx.clone(true), [fbx]);
-  const { actions, names } = useAnimations(clone.animations || [], group);
+  // Use fbx directly – cloning breaks bone references on FBX
+  const { actions, names } = useAnimations(fbx.animations || [], group);
 
   useEffect(() => {
-    if (names.length > 0 && actions[names[0]]) {
-      actions[names[0]]!.reset().fadeIn(0.3).play();
-    }
-    return () => {
-      Object.values(actions).forEach(a => a?.fadeOut(0.3));
-    };
+    if (names.length === 0) return;
+    const first = actions[names[0]];
+    if (first) first.reset().fadeIn(0.4).play();
+    return () => { Object.values(actions).forEach(a => a?.stop()); };
   }, [actions, names]);
 
-  return <group ref={group}><primitive object={clone} scale={0.01} /></group>;
+  return <group ref={group}><primitive object={fbx} scale={0.01} /></group>;
 };
 
 const CustomModelGLTFLoader = ({ url }: { url: string }) => {
   const group = useRef<THREE.Group>(null);
   const { scene, animations } = useGLTF(url);
-  const clone = React.useMemo(() => scene.clone(true), [scene]);
+  // useAnimations binds the mixer to 'group', which holds the scene;
+  // the tracks resolve bones by name so this works with the live scene.
   const { actions, names } = useAnimations(animations, group);
 
   useEffect(() => {
-    if (names.length > 0 && actions[names[0]]) {
-      actions[names[0]]!.reset().fadeIn(0.3).play();
-    }
-    return () => {
-      Object.values(actions).forEach(a => a?.fadeOut(0.3));
-    };
+    if (names.length === 0) return;
+    const first = actions[names[0]];
+    if (first) first.reset().fadeIn(0.4).play();
+    return () => { Object.values(actions).forEach(a => a?.stop()); };
   }, [actions, names]);
 
-  return <group ref={group}><primitive object={clone} /></group>;
+  return <group ref={group}><primitive object={scene} /></group>;
 };
 
 const CustomModelRenderer = ({ url }: { url: string }) => {

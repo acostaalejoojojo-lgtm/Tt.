@@ -20,6 +20,7 @@ import { playFab } from '../lib/playfab';
 import { sessionManager } from '../lib/session';
 import { getSupabaseClient, isSupabaseEnabled } from '../lib/supabase';
 import { GraphicsEngine } from '../components/GraphicsEngine';
+import { hybridMesh, ICE_SERVERS, getInfraLayers } from '../lib/meshNetwork';
 
 // --- WEBRTC MANAGER ---
 
@@ -64,7 +65,7 @@ class WebRTCManager {
     if (this.peers.has(targetId)) return this.peers.get(targetId);
 
     const pc = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      iceServers: ICE_SERVERS
     });
 
     this.peers.set(targetId, pc);
@@ -1267,11 +1268,12 @@ const PlayerController: React.FC<PlayerControllerProps> = ({
         }
 
         // --- CAMERA ELASTIC FOLLOW (SMOOTH & RESPONSIVE) ---
-        const camDist = 14; 
-        const camHeight = 7;
-        const lerpFactor = 0.15; // Increased for better reaction speed
-        
-        // Elastic Camera Position Calculation
+        const camDist = 12;
+        const camHeight = 6;
+        // Faster lerp when moving, slower when idle for cinematic feel
+        const lerpFactor = moving ? 0.12 : 0.08;
+
+        // Elastic Camera Position Calculation — follows avatar rotation
         const targetCamX = nextPos.x - Math.sin(rot.y) * camDist + shakeRef.current.x;
         const targetCamZ = nextPos.z - Math.cos(rot.y) * camDist + shakeRef.current.z;
         const targetCamY = nextPos.y + camHeight + shakeRef.current.y;
@@ -1281,10 +1283,15 @@ const PlayerController: React.FC<PlayerControllerProps> = ({
             THREE.MathUtils.lerp(state.camera.position.y, targetCamY, lerpFactor),
             THREE.MathUtils.lerp(state.camera.position.z, targetCamZ, lerpFactor)
         );
-        
-        // Always look at the avatar's core (smoothly)
-        const lookTarget = new THREE.Vector3(nextPos.x, nextPos.y + 2.5, nextPos.z);
+
+        // Look at avatar head height for a natural third-person feel
+        const lookTarget = new THREE.Vector3(nextPos.x, nextPos.y + 3, nextPos.z);
         state.camera.lookAt(lookTarget);
+        const cam = state.camera as THREE.PerspectiveCamera;
+        if (cam.fov !== undefined) {
+            cam.fov = THREE.MathUtils.lerp(cam.fov, moving ? 70 : 65, 0.05);
+            cam.updateProjectionMatrix();
+        }
     });
 
     const avatarReplacement = mapObjects.find(obj => obj.isAvatarReplacement);
@@ -2180,11 +2187,19 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
   const [isShooter, setIsShooter] = useState(false);
   const [showTeamIntro, setShowTeamIntro] = useState(false);
   const [userTeam, setUserTeam] = useState<'Red' | 'Blue' | null>(null);
+  const [showInfraPanel, setShowInfraPanel] = useState(false);
+  const [infraStats, setInfraStats] = useState(() => hybridMesh.getStats());
 
   useEffect(() => {
      setIsShooter(objects.some(obj => obj.isShooter));
   }, [objects]);
   
+  // Refresh HybridMesh stats every 3 s
+  useEffect(() => {
+    const id = setInterval(() => setInfraStats(hybridMesh.getStats()), 3000);
+    return () => clearInterval(id);
+  }, []);
+
   // Multiplayer State
   const [remotePlayers, setRemotePlayers] = useState<RemotePlayer[]>([]);
   const remotePlayersRef = useRef<RemotePlayer[]>([]);
@@ -2223,6 +2238,15 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
               config: avatarConfig,
               country: 'ES'
           });
+          // Attach HybridMesh (Layer 2 + 3) to the live socket
+          const localId = socket.id || playerName || username || 'anon-' + Date.now();
+          hybridMesh.init(
+              roomId,
+              localId,
+              (event, data) => socket.emit(event, data),
+              (_peerId, _data) => { /* merged via player-updated */ }
+          );
+          console.log('[HybridMesh] Connected — Socket.io + WebRTC P2P + GUN active');
       });
 
       socket.on('room-state', (state) => {
@@ -2287,12 +2311,13 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
           webrtcManager.current?.handleSignal(senderId, signal);
       });
 
-      // Proximity check interval
+      // Proximity check interval — Voice (WebRTCManager) + Data P2P (HybridMesh)
       const proximityInterval = setInterval(() => {
-          if (!socket.connected || !webrtcManager.current) return;
+          if (!socket.connected) return;
           
           const localPlayer = (window as any).localPlayerPos || { x: 0, y: 0, z: 0 };
-          const PROXIMITY_DISTANCE = 40; // Balanced range for proximity chat
+          const VOICE_DISTANCE = 40;
+          const P2P_DISTANCE = 80; // wider range for data-channel mesh
 
           remotePlayersRef.current.forEach(player => {
               const dist = Math.sqrt(
@@ -2301,16 +2326,26 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
                   Math.pow(player.position[2] - localPlayer.z, 2)
               );
 
-              if (dist < PROXIMITY_DISTANCE) {
-                  if (!webrtcManager.current?.peers.has(player.id)) {
-                      console.log(`[VOICE] Entry: Connecting to ${player.username}`);
-                      webrtcManager.current?.createPeer(player.id, true);
+              // Voice WebRTC (existing)
+              if (webrtcManager.current) {
+                  if (dist < VOICE_DISTANCE) {
+                      if (!webrtcManager.current.peers.has(player.id)) {
+                          console.log(`[VOICE] Entry: Connecting to ${player.username}`);
+                          webrtcManager.current.createPeer(player.id, true);
+                      }
+                  } else {
+                      if (webrtcManager.current.peers.has(player.id)) {
+                          console.log(`[VOICE] Exit: Disconnecting from ${player.username}`);
+                          webrtcManager.current.removePeer(player.id);
+                      }
                   }
+              }
+
+              // P2P Data channel (HybridMesh Layer 2)
+              if (dist < P2P_DISTANCE) {
+                  hybridMesh.connectToPeer(player.id);
               } else {
-                  if (webrtcManager.current?.peers.has(player.id)) {
-                      console.log(`[VOICE] Exit: Disconnecting from ${player.username}`);
-                      webrtcManager.current?.removePeer(player.id);
-                  }
+                  hybridMesh.disconnectPeer(player.id);
               }
           });
       }, 1500);
@@ -2319,6 +2354,7 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
           console.log("Cleaning up socket connection");
           socket.disconnect();
           webrtcManager.current?.destroy();
+          hybridMesh.destroy();
           clearInterval(proximityInterval);
       };
   }, [activeServer?.id, initialGame?.id, playerName, avatarConfig]); // Re-connect if identity or room changes
@@ -2675,6 +2711,51 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
                         <div className="text-center">
                             <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Team</div>
                             <div className={`text-xl font-black italic ${userTeam === 'Red' ? 'text-red-500' : 'text-blue-500'}`}>{userTeam || 'N/A'}</div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* ─── HYBRID MESH INFRASTRUCTURE PANEL ─── */}
+            <button
+                onClick={() => setShowInfraPanel(p => !p)}
+                className="absolute top-4 left-4 pointer-events-auto flex items-center gap-1.5 bg-black/50 border border-white/10 backdrop-blur-md px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest text-green-400 hover:border-green-500/50 transition-all"
+            >
+                <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+                MESH · {infraStats.peersP2P} P2P
+            </button>
+
+            {showInfraPanel && (
+                <div className="absolute top-12 left-4 pointer-events-auto bg-black/80 border border-white/10 backdrop-blur-xl rounded-2xl p-4 w-72 space-y-3 shadow-2xl">
+                    <div className="text-[10px] font-black uppercase tracking-widest text-white border-b border-white/10 pb-2 flex items-center justify-between">
+                        <span>Infraestructura HybridMesh</span>
+                        <span className="text-gray-500">3 capas</span>
+                    </div>
+                    {getInfraLayers(infraStats).map(layer => (
+                        <div key={layer.name} className="flex items-start gap-3">
+                            <div className="mt-0.5 w-2 h-2 rounded-full flex-shrink-0 animate-pulse" style={{ backgroundColor: layer.color }} />
+                            <div className="flex-1 min-w-0">
+                                <div className="flex items-center justify-between">
+                                    <span className="text-[10px] font-black text-white tracking-widest">{layer.name}</span>
+                                    <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${
+                                        layer.status === 'OPTIMAL' ? 'bg-green-500/20 text-green-400' :
+                                        layer.status === 'DEGRADED' ? 'bg-yellow-500/20 text-yellow-400' :
+                                        'bg-red-500/20 text-red-400'
+                                    }`}>{layer.status}</span>
+                                </div>
+                                <p className="text-[9px] text-gray-500 mt-0.5 leading-tight">{layer.description}</p>
+                                <div className="text-[9px] text-gray-600 mt-0.5">latency ~{layer.latency}ms</div>
+                            </div>
+                        </div>
+                    ))}
+                    <div className="border-t border-white/10 pt-2 grid grid-cols-2 gap-2">
+                        <div className="bg-white/5 rounded-lg p-2">
+                            <div className="text-[9px] text-gray-500 uppercase tracking-widest">Paquetes</div>
+                            <div className="text-sm font-black text-white">{infraStats.packetsSent}</div>
+                        </div>
+                        <div className="bg-white/5 rounded-lg p-2">
+                            <div className="text-[9px] text-gray-500 uppercase tracking-widest">Throughput</div>
+                            <div className="text-sm font-black text-white">{infraStats.throughputKbps} KB/s</div>
                         </div>
                     </div>
                 </div>
