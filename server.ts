@@ -14,6 +14,7 @@ import rateLimit from "express-rate-limit";
 import pg from "pg";
 import { setupMaster, setupWorker } from "@socket.io/sticky";
 import { createAdapter, setupPrimary } from "@socket.io/cluster-adapter";
+import Gun from "gun";
 
 // Database Configuration (BYOB PostgreSQL Mesh)
 const pool = new pg.Pool({
@@ -469,12 +470,26 @@ async function startServer() {
   app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
   const httpServer = createServer(app);
+
+  // ── GUN DECENTRALISED RELAY ── runs as a real relay node on this server
+  // Clients connect via ws://<host>/gun  — no external dependency needed
+  const gun = (Gun as any)({ web: httpServer, localStorage: false, radisk: false });
+  console.log(`[GUN RELAY] Decentralised relay node active on /gun`);
+
   const io = new Server(httpServer, {
-    cors: {
-      origin: "*",
-      methods: ["GET", "POST"]
-    },
-    transports: ['websocket', 'polling'] // Prefer WebSocket with fallback
+    cors: { origin: "*", methods: ["GET", "POST"] },
+    transports: ['websocket', 'polling'],
+    // ── High-concurrency tuning ──────────────────────────────────────────
+    maxHttpBufferSize: 1e6,          // 1 MB max message (enough for state)
+    pingTimeout: 20000,              // 20 s before considering a dead conn
+    pingInterval: 10000,             // probe every 10 s
+    upgradeTimeout: 10000,
+    allowUpgrades: true,
+    perMessageDeflate: {             // WebSocket per-frame compression
+      threshold: 128,               // compress frames >128 bytes
+      zlibDeflateOptions: { level: 6 },
+      zlibInflateOptions: { chunkSize: 10 * 1024 }
+    }
   });
 
   // Connect Socket.io to the Cluster Adapter for cross-worker communication
@@ -1017,10 +1032,37 @@ async function startServer() {
   const rooms: Record<string, {
     players: Record<string, any>;
     mapObjects: any[];
+    lastActivity: number;
   }> = {};
 
   const activeUserSockets = new Map<string, string>(); // socket.id -> username
   const MAX_GLOBAL_PLAYERS = 50;
+
+  // ── Delta-state tracking per socket ─────────────────────────────────────
+  // Stores last broadcasted position so we only send diffs
+  const lastPlayerState = new Map<string, { x: number; y: number; z: number; ry: number }>();
+
+  // ── Per-socket update rate limiter ────────────────────────────────────────
+  // Limits position updates to max 20/sec per socket to avoid flooding
+  const updateThrottle = new Map<string, number>(); // socket.id -> last emit timestamp
+
+  // ── P2P Relay pairs ───────────────────────────────────────────────────────
+  // When two clients can't do WebRTC directly, they relay through this server
+  const relayPairs = new Map<string, Set<string>>(); // socket.id -> Set of relay target ids
+
+  // ── Room cleanup interval ─────────────────────────────────────────────────
+  // Remove rooms with 0 players that haven't had activity in 5 min
+  setInterval(() => {
+    const now = Date.now();
+    for (const roomId in rooms) {
+      const room = rooms[roomId];
+      const isEmpty = Object.keys(room.players).length === 0;
+      const stale = now - (room.lastActivity || 0) > 5 * 60 * 1000;
+      if (isEmpty && stale) {
+        delete rooms[roomId];
+      }
+    }
+  }, 60_000);
 
   io.on("connection", (socket) => {
     console.log("[CLUSTER] New edge connection established:", socket.id);
@@ -1191,7 +1233,7 @@ async function startServer() {
     });
 
     socket.on("join-room", (roomId, userData) => {
-      // Photon Engine Room Limit Logic (20 users max)
+      // Room limit logic
       const currentInRoom = rooms[roomId] ? Object.keys(rooms[roomId].players).length : 0;
       if (currentInRoom >= ROOM_USER_LIMIT) {
         socket.emit("room-full", { roomId, limit: ROOM_USER_LIMIT });
@@ -1200,8 +1242,9 @@ async function startServer() {
 
       socket.join(roomId);
       if (!rooms[roomId]) {
-        rooms[roomId] = { players: {}, mapObjects: [] };
+        rooms[roomId] = { players: {}, mapObjects: [], lastActivity: Date.now() };
       }
+      rooms[roomId].lastActivity = Date.now();
       
       rooms[roomId].players[socket.id] = {
         id: socket.id,
@@ -1213,21 +1256,41 @@ async function startServer() {
         isTalking: false
       };
 
-      // Send current state to the new player
       socket.emit("room-state", rooms[roomId]);
-      
-      // Notify others
       socket.to(roomId).emit("player-joined", rooms[roomId].players[socket.id]);
     });
 
     socket.on("update-player", (roomId, data) => {
-      if (rooms[roomId] && rooms[roomId].players[socket.id]) {
-        rooms[roomId].players[socket.id] = {
-          ...rooms[roomId].players[socket.id],
-          ...data
-        };
-        socket.to(roomId).emit("player-updated", rooms[roomId].players[socket.id]);
-      }
+      if (!rooms[roomId] || !rooms[roomId].players[socket.id]) return;
+
+      // ── Rate limit: max 20 updates/sec per socket ──────────────────────
+      const now = Date.now();
+      const lastUpdate = updateThrottle.get(socket.id) || 0;
+      if (now - lastUpdate < 50) return; // drop if < 50ms since last update
+      updateThrottle.set(socket.id, now);
+
+      // ── Delta encoding: only broadcast changed fields ──────────────────
+      const prev = lastPlayerState.get(socket.id);
+      const pos = data.position || [0, 0, 0];
+      const ry = data.rotation?.[1] ?? 0;
+      const dx = Math.abs(pos[0] - (prev?.x ?? Infinity));
+      const dy = Math.abs(pos[1] - (prev?.y ?? Infinity));
+      const dz = Math.abs(pos[2] - (prev?.z ?? Infinity));
+      const dr = Math.abs(ry - (prev?.ry ?? Infinity));
+
+      // Skip if position hasn't moved more than 0.01 units and not animating
+      const hasMovement = dx > 0.01 || dy > 0.01 || dz > 0.01 || dr > 0.01;
+      const hasStateChange = data.isMoving !== undefined || data.isJumping !== undefined || data.isShooting !== undefined;
+
+      if (!hasMovement && !hasStateChange) return;
+
+      lastPlayerState.set(socket.id, { x: pos[0], y: pos[1], z: pos[2], ry });
+
+      rooms[roomId].lastActivity = Date.now();
+      rooms[roomId].players[socket.id] = { ...rooms[roomId].players[socket.id], ...data };
+
+      // Send compact delta object to other players in room
+      socket.to(roomId).emit("player-updated", rooms[roomId].players[socket.id]);
     });
 
     socket.on("update-map", (roomId, mapObjects) => {
@@ -1252,9 +1315,45 @@ async function startServer() {
       socket.to(roomId).emit("player-speaking", socket.id, false);
     });
 
+    // ── P2P SERVER RELAY ────────────────────────────────────────────────────
+    // Used when two clients cannot establish a direct WebRTC data channel.
+    // Client calls p2p-relay-connect to open a relay channel through the server.
+    // All subsequent p2p-relay-data messages are forwarded to the target socket.
+
+    socket.on("p2p-relay-connect", (targetId: string) => {
+      if (!relayPairs.has(socket.id)) relayPairs.set(socket.id, new Set());
+      relayPairs.get(socket.id)!.add(targetId);
+
+      // Tell both sides the relay is open
+      socket.emit("p2p-relay-ready", { targetId, via: "server-relay" });
+      io.to(targetId).emit("p2p-relay-ready", { targetId: socket.id, via: "server-relay" });
+      console.log(`[P2P RELAY] ${socket.id} <-> ${targetId} relay channel opened`);
+    });
+
+    socket.on("p2p-relay-data", (targetId: string, data: any) => {
+      // Forward the game-state payload to the target socket directly
+      // This is a real server-mediated relay — no WebRTC needed between these peers
+      io.to(targetId).emit("p2p-relay-data", socket.id, data);
+    });
+
+    socket.on("p2p-relay-disconnect", (targetId: string) => {
+      relayPairs.get(socket.id)?.delete(targetId);
+      io.to(targetId).emit("p2p-relay-closed", socket.id);
+    });
+
     socket.on("disconnect", async () => {
       console.log("[CLUSTER] Connection terminated:", socket.id);
       clusterManager.updateLoad(connectionRegion, -1);
+
+      // Clean up delta / throttle state
+      lastPlayerState.delete(socket.id);
+      updateThrottle.delete(socket.id);
+
+      // Close any open relay channels
+      relayPairs.get(socket.id)?.forEach(targetId => {
+        io.to(targetId).emit("p2p-relay-closed", socket.id);
+      });
+      relayPairs.delete(socket.id);
       
       const username = activeUserSockets.get(socket.id);
       if (username) {

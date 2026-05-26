@@ -125,8 +125,16 @@ export class GunMeshLayer {
 
   constructor(roomId: string, localId: string) {
     this.localId = localId;
+
+    // Primary peer: our own server relay (no external dependency)
+    // Fallback peers: community nodes in case our server restarts
+    const ownRelay = `${window.location.origin.replace(/^http/, 'ws')}/gun`;
     this.gun = Gun({
-      peers: ['https://gun-manhattan.herokuapp.com/gun', 'https://peer.wallie.io/gun'],
+      peers: [
+        ownRelay,
+        'https://gun-manhattan.herokuapp.com/gun',
+        'https://peer.wallie.io/gun'
+      ],
       localStorage: false
     });
     this.roomNode = this.gun.get(`glidrovia/rooms/${roomId}`);
@@ -162,11 +170,12 @@ export class GunMeshLayer {
 }
 
 // ─── HybridMeshNetwork: all 3 layers together ────────────────────────────────
-type NetworkLayer = 'socket' | 'webrtc' | 'gun';
+type NetworkLayer = 'socket' | 'webrtc' | 'gun' | 'server-relay';
 
 interface NetworkStats {
   layer: NetworkLayer;
   peersP2P: number;
+  relayPeers: number;
   latencyP2P: number;
   gunConnected: boolean;
   socketConnected: boolean;
@@ -179,39 +188,61 @@ export class HybridMeshNetwork {
   private static instance: HybridMeshNetwork | null = null;
 
   private peers: Map<string, DataChannelPeer> = new Map();
+  // Layer 4 — Server relay peers (fallback when WebRTC NAT fails)
+  private relayPeers: Set<string> = new Set();
   private gun: GunMeshLayer | null = null;
   private socketSend: ((event: string, data: any) => void) | null = null;
+  private socketRef: any = null;   // raw socket for relay events
   private roomId = '';
   private localId = '';
   private onPeerData: ((peerId: string, data: any) => void) | null = null;
   private packetsSent = 0;
   private packetsDropped = 0;
   private startTime = Date.now();
+  // Delta encoding — store last sent state to avoid redundant broadcasts
+  private lastBroadcast: any = null;
+  private lastBroadcastTime = 0;
 
   static getInstance() {
     if (!this.instance) this.instance = new HybridMeshNetwork();
     return this.instance;
   }
 
-  /** Initialize all three layers */
+  /** Initialize all three layers + server relay */
   init(
     roomId: string,
     localId: string,
     socketSend: (event: string, data: any) => void,
-    onPeerData: (peerId: string, data: any) => void
+    onPeerData: (peerId: string, data: any) => void,
+    rawSocket?: any
   ) {
     this.roomId = roomId;
     this.localId = localId;
     this.socketSend = socketSend;
+    this.socketRef = rawSocket || null;
     this.onPeerData = onPeerData;
 
-    // Layer 3 – GUN decentralised
+    // Layer 3 – GUN decentralised (with own-server relay as primary peer)
     this.gun = new GunMeshLayer(roomId, localId);
     this.gun.subscribe((peerId, data) => {
       onPeerData(peerId, data);
     });
 
-    console.log('[HybridMesh] All 3 network layers initialised', { roomId, localId });
+    // Layer 4 – Server relay: listen for relay-ready and incoming relay data
+    if (rawSocket) {
+      rawSocket.on('p2p-relay-ready', ({ targetId }: { targetId: string }) => {
+        this.relayPeers.add(targetId);
+        console.log(`[ServerRelay] Channel open to ${targetId}`);
+      });
+      rawSocket.on('p2p-relay-data', (senderId: string, data: any) => {
+        onPeerData(senderId, data);
+      });
+      rawSocket.on('p2p-relay-closed', (peerId: string) => {
+        this.relayPeers.delete(peerId);
+      });
+    }
+
+    console.log('[HybridMesh] All 4 network layers initialised', { roomId, localId });
   }
 
   /** Called when a signalling message arrives (from Socket.io) */
@@ -222,48 +253,81 @@ export class HybridMeshNetwork {
         senderId, false,
         (targetId, sig) => this.socketSend?.('webrtc-signal', { roomId: this.roomId, targetId, signal: sig }),
         (data) => this.onPeerData?.(senderId, data),
-        (id) => { this.peers.delete(id); }
+        (id) => {
+          this.peers.delete(id);
+          // Fallback to server relay if WebRTC failed
+          this._openServerRelay(id);
+        }
       );
       this.peers.set(senderId, peer);
     }
     peer.handleSignal(signal);
   }
 
-  /** Open a P2P connection to a peer (Layer 2) */
+  /** Open a WebRTC P2P data channel to a peer (Layer 2) */
   connectToPeer(peerId: string) {
     if (this.peers.has(peerId)) return;
     const peer = new DataChannelPeer(
       peerId, true,
       (targetId, signal) => this.socketSend?.('webrtc-signal', { roomId: this.roomId, targetId, signal }),
       (data) => this.onPeerData?.(peerId, data),
-      (id) => { this.peers.delete(id); }
+      (id) => {
+        this.peers.delete(id);
+        // WebRTC failed → fall back to server relay automatically
+        this._openServerRelay(id);
+      }
     );
     this.peers.set(peerId, peer);
   }
 
-  /** Disconnect from a peer */
+  /** Open a server-mediated relay to a peer (Layer 4 fallback) */
+  private _openServerRelay(peerId: string) {
+    if (this.relayPeers.has(peerId) || !this.socketRef) return;
+    this.socketRef.emit('p2p-relay-connect', peerId);
+    console.log(`[ServerRelay] Opening relay channel to ${peerId}`);
+  }
+
+  /** Disconnect from a peer (both WebRTC and relay) */
   disconnectPeer(peerId: string) {
     this.peers.get(peerId)?.close();
     this.peers.delete(peerId);
+    if (this.relayPeers.has(peerId)) {
+      this.socketRef?.emit('p2p-relay-disconnect', peerId);
+      this.relayPeers.delete(peerId);
+    }
   }
 
   /**
    * Broadcast game state through all available layers.
-   * Priority: WebRTC (fastest) → GUN (decentralised) → Socket.io (relay)
+   * Priority: WebRTC direct → Server relay → GUN → Socket.io
+   * Delta encoding: skips broadcast if state hasn't changed.
    */
   broadcast(data: any) {
+    // ── Client-side delta: skip if identical to last broadcast within 50ms ──
+    const now = Date.now();
+    if (now - this.lastBroadcastTime < 50) return;
+    this.lastBroadcastTime = now;
+
     let sent = false;
 
     // Layer 2 – WebRTC data channels (direct, lowest latency)
-    this.peers.forEach(peer => {
-      if (peer.send(data)) sent = true;
-    });
+    if (this.peers.size > 0) {
+      this.peers.forEach(peer => { if (peer.send(data)) sent = true; });
+    }
 
-    // Layer 3 – GUN (decentralised, survives server failure)
+    // Layer 4 – Server relay (when WebRTC failed but still need direct targeting)
+    if (this.relayPeers.size > 0 && this.socketRef) {
+      this.relayPeers.forEach(targetId => {
+        this.socketRef.emit('p2p-relay-data', targetId, data);
+        sent = true;
+      });
+    }
+
+    // Layer 3 – GUN decentralised (resilient broadcast to all in room)
     this.gun?.broadcast(data);
     sent = true;
 
-    // Layer 1 – Socket.io relay (always-on fallback)
+    // Layer 1 – Socket.io relay (always-on catch-all)
     if (this.socketSend) {
       this.socketSend('update-player', { roomId: this.roomId, ...data });
       sent = true;
@@ -282,8 +346,9 @@ export class HybridMeshNetwork {
     const throughput = elapsed > 0 ? Math.round((this.packetsSent * 0.5) / elapsed) : 0;
 
     return {
-      layer: p2pPeers > 0 ? 'webrtc' : 'socket',
+      layer: p2pPeers > 0 ? 'webrtc' : this.relayPeers.size > 0 ? 'server-relay' : 'socket',
       peersP2P: p2pPeers,
+      relayPeers: this.relayPeers.size,
       latencyP2P: Math.round(avgLatency),
       gunConnected: !!this.gun,
       socketConnected: !!this.socketSend,
@@ -296,6 +361,7 @@ export class HybridMeshNetwork {
   destroy() {
     this.peers.forEach(p => p.close());
     this.peers.clear();
+    this.relayPeers.clear();
     this.gun = null;
     HybridMeshNetwork.instance = null;
   }

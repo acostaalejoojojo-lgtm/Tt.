@@ -2238,15 +2238,16 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
               config: avatarConfig,
               country: 'ES'
           });
-          // Attach HybridMesh (Layer 2 + 3) to the live socket
+          // Attach HybridMesh (Layers 2+3+4) to the live socket
           const localId = socket.id || playerName || username || 'anon-' + Date.now();
           hybridMesh.init(
               roomId,
               localId,
               (event, data) => socket.emit(event, data),
-              (_peerId, _data) => { /* merged via player-updated */ }
+              (_peerId, _data) => { /* peer data merged via player-updated / relay events */ },
+              socket   // pass raw socket so Layer 4 (server relay) can listen
           );
-          console.log('[HybridMesh] Connected — Socket.io + WebRTC P2P + GUN active');
+          console.log('[HybridMesh] Connected — Socket.io + WebRTC P2P + GUN + Server Relay active');
       });
 
       socket.on('room-state', (state) => {
