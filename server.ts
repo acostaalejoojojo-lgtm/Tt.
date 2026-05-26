@@ -417,8 +417,8 @@ async function startCluster() {
     // Setup Cluster Adapter to sync events between cores
     setupPrimary();
 
-    httpServer.listen(3000, "0.0.0.0", () => {
-      console.log(`[MESH PRIMARY] Listening on port 3000 (Load Balancer Active)`);
+    httpServer.listen(5000, "0.0.0.0", () => {
+      console.log(`[MESH PRIMARY] Listening on port 5000 (Load Balancer Active)`);
     });
 
     for (let i = 0; i < os.cpus().length; i++) {
@@ -1278,7 +1278,7 @@ async function startServer() {
   });
 
   // API fallback: return JSON for missing API routes instead of HTML
-  app.all("/api/*", (req, res) => {
+  app.all("/api/*path", (req, res) => {
     console.log(`[API] 404 Not Found: ${req.method} ${req.url}`);
     res.status(404).json({ error: "Route not found", path: req.url });
   });
