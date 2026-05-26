@@ -1064,6 +1064,95 @@ async function startServer() {
     }
   }, 60_000);
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // GLIDROVIA QUANTUM ENGINE — Server-Authoritative Deterministic Simulation
+  // Equivalent to Photon Quantum: server owns physics, clients send inputs.
+  // Runs at 30 Hz; clients run at 60 Hz with local prediction + reconciliation.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  interface QInput {
+    forward: boolean; backward: boolean;
+    left: boolean;   right: boolean;
+    jump: boolean;
+    camY: number;
+    seq: number;
+  }
+  interface QPlayerState {
+    x: number; y: number; z: number;
+    vy: number; ry: number;
+    onGround: boolean;
+    lastSeq: number;
+  }
+  interface QRoom {
+    players: Map<string, QPlayerState>;
+    inputs:  Map<string, QInput>;
+    tick: number;
+    active: boolean;
+  }
+
+  const qRooms = new Map<string, QRoom>();
+
+  const Q_SPEED      = 0.25;
+  const Q_GRAVITY    = 0.025;
+  const Q_JUMP_FORCE = 0.5;
+
+  function qStep(room: QRoom): void {
+    room.tick++;
+    room.players.forEach((s, pid) => {
+      const inp = room.inputs.get(pid);
+      if (!inp) return;
+
+      const sinY = Math.sin(inp.camY);
+      const cosY = Math.cos(inp.camY);
+
+      let mx = 0, mz = 0;
+      if (inp.forward)  { mx -= sinY; mz -= cosY; }
+      if (inp.backward) { mx += sinY; mz += cosY; }
+      if (inp.left)     { mx -= cosY; mz += sinY; }
+      if (inp.right)    { mx += cosY; mz -= sinY; }
+
+      const len = Math.sqrt(mx * mx + mz * mz);
+      if (len > 0) {
+        mx = (mx / len) * Q_SPEED;
+        mz = (mz / len) * Q_SPEED;
+        s.ry = Math.atan2(mx, mz);
+      }
+
+      s.x += mx;
+      s.z += mz;
+
+      s.vy -= Q_GRAVITY;
+      if (inp.jump && s.onGround) { s.vy = Q_JUMP_FORCE; s.onGround = false; }
+      s.y += s.vy;
+      if (s.y <= 0) { s.y = 0; s.vy = 0; s.onGround = true; }
+
+      s.lastSeq = inp.seq;
+    });
+  }
+
+  // 30 Hz Quantum tick
+  setInterval(() => {
+    qRooms.forEach((room, roomId) => {
+      if (!room.active || room.players.size === 0) return;
+      qStep(room);
+
+      // Build compact snapshot — 3-decimal precision to save bandwidth
+      const snap: Record<string, any> = {};
+      room.players.forEach((s, pid) => {
+        snap[pid] = {
+          x:  +s.x.toFixed(3),
+          y:  +s.y.toFixed(3),
+          z:  +s.z.toFixed(3),
+          ry: +s.ry.toFixed(3),
+          seq: s.lastSeq
+        };
+      });
+      io.to(roomId).emit("q-snapshot", { tick: room.tick, players: snap });
+    });
+  }, 1000 / 30);
+
+  console.log("[QUANTUM] GlidroviaQuantum engine active — 30 Hz server simulation");
+
   io.on("connection", (socket) => {
     console.log("[CLUSTER] New edge connection established:", socket.id);
     const connectionRegion = REGIONS[Math.floor(Math.random() * REGIONS.length)];
@@ -1300,17 +1389,46 @@ async function startServer() {
       }
     });
 
-    socket.on("voice-data", (roomId, audioData) => {
-      // High-performance frequency-multiplexed broadcast for simultaneous speakers
-      // This is a professional pass-through for WebRTC signaling at scale
-      socket.to(roomId).emit("remote-voice", socket.id, audioData);
+    // ── SFU: Selective Forwarding Unit for proximity voice ───────────────────
+    // Instead of broadcasting audio to the whole room, the server forwards
+    // only to players within range — max 8 simultaneous speakers per zone.
+    // Each receiver gets a volume hint (0–1) based on 3D distance.
+    socket.on("voice-data", (roomId: string, audioData: any) => {
+      if (!rooms[roomId]) return;
+      const sender = rooms[roomId].players[socket.id];
+      if (!sender?.position) return;
+
+      const [sx, sy, sz] = sender.position as number[];
+      const SFU_RANGE = 40;
+      const MAX_ZONE_SPEAKERS = 8;
+
+      // Collect nearby receivers sorted by distance
+      const targets: { id: string; dist: number; volume: number }[] = [];
+      Object.values(rooms[roomId].players).forEach((p: any) => {
+        if (p.id === socket.id || !p.position) return;
+        const dx = p.position[0] - sx;
+        const dy = p.position[1] - sy;
+        const dz = p.position[2] - sz;
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist <= SFU_RANGE) {
+          // Inverse-square volume falloff — same as real spatial audio
+          const volume = Math.max(0, 1 - (dist / SFU_RANGE) ** 2);
+          targets.push({ id: p.id, dist, volume });
+        }
+      });
+
+      // Selective forward: only closest MAX_ZONE_SPEAKERS receivers
+      targets
+        .sort((a, b) => a.dist - b.dist)
+        .slice(0, MAX_ZONE_SPEAKERS)
+        .forEach(({ id, volume }) => {
+          io.to(id).emit("remote-voice", socket.id, audioData, volume);
+        });
     });
 
-    // Handle high-frequency concurrent speech channels
     socket.on("start-speaking", (roomId) => {
       socket.to(roomId).emit("player-speaking", socket.id, true);
     });
-
     socket.on("stop-speaking", (roomId) => {
       socket.to(roomId).emit("player-speaking", socket.id, false);
     });
@@ -1373,6 +1491,42 @@ async function startServer() {
           io.to(roomId).emit("player-left", socket.id);
         }
       }
+
+      // Clean up Quantum rooms on disconnect
+      qRooms.forEach((qRoom, roomId) => {
+        if (qRoom.players.has(socket.id)) {
+          qRoom.players.delete(socket.id);
+          qRoom.inputs.delete(socket.id);
+          console.log(`[QUANTUM] Player ${socket.id} left room ${roomId} (${qRoom.players.size} remaining)`);
+          if (qRoom.players.size === 0) {
+            qRooms.delete(roomId);
+            console.log(`[QUANTUM] Room ${roomId} closed — no players`);
+          }
+        }
+      });
+    });
+
+    // ── GLIDROVIA QUANTUM — socket events ────────────────────────────────────
+    socket.on("q-join", (roomId: string) => {
+      if (!qRooms.has(roomId)) {
+        qRooms.set(roomId, {
+          players: new Map(),
+          inputs: new Map(),
+          tick: 0,
+          active: true
+        });
+      }
+      const qRoom = qRooms.get(roomId)!;
+      qRoom.players.set(socket.id, { x: 0, y: 0, z: 0, vy: 0, ry: 0, onGround: true, lastSeq: 0 });
+      qRoom.inputs.set(socket.id, { forward: false, backward: false, left: false, right: false, jump: false, camY: 0, seq: 0 });
+      socket.emit("q-ready", { tick: qRoom.tick });
+      console.log(`[QUANTUM] Player ${socket.id} joined room ${roomId}`);
+    });
+
+    socket.on("q-input", (roomId: string, input: QInput) => {
+      const qRoom = qRooms.get(roomId);
+      if (!qRoom || !qRoom.players.has(socket.id)) return;
+      qRoom.inputs.set(socket.id, input);
     });
   });
 

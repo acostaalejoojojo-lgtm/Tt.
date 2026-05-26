@@ -21,6 +21,7 @@ import { sessionManager } from '../lib/session';
 import { getSupabaseClient, isSupabaseEnabled } from '../lib/supabase';
 import { GraphicsEngine } from '../components/GraphicsEngine';
 import { hybridMesh, ICE_SERVERS, getInfraLayers } from '../lib/meshNetwork';
+import { GlidroviaQuantum } from '../lib/quantum';
 
 // --- WEBRTC MANAGER ---
 
@@ -2206,6 +2207,8 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
   const socketRef = useRef<Socket | null>(null);
   const mediaStream = useRef<MediaStream | null>(null);
   const webrtcManager = useRef<WebRTCManager | null>(null);
+  const quantumRef = useRef<GlidroviaQuantum | null>(null);
+  const [quantumStats, setQuantumStats] = useState<ReturnType<GlidroviaQuantum['getStats']> | null>(null);
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
 
   // Sync ref with state
@@ -2248,6 +2251,41 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
               socket   // pass raw socket so Layer 4 (server relay) can listen
           );
           console.log('[HybridMesh] Connected — Socket.io + WebRTC P2P + GUN + Server Relay active');
+
+          // ── GlidroviaQuantum Engine ──────────────────────────────────────
+          // Server-authoritative deterministic simulation at 30 Hz
+          // Clients run local prediction at 60 Hz + reconciliation
+          const quantum = new GlidroviaQuantum(socket, roomId, localId);
+          quantumRef.current = quantum;
+
+          quantum.onConnected = () => {
+              console.log('[GlidroviaQuantum] ✓ Server-authoritative 30Hz simulation active');
+          };
+
+          // Expose remote player positions from Quantum for the renderer
+          quantum.onRemoteUpdate = (players) => {
+              setRemotePlayers(prev => prev.map(rp => {
+                  const qp = players[rp.id];
+                  if (!qp) return rp;
+                  return {
+                      ...rp,
+                      position: [qp.x, qp.y, qp.z],
+                      rotation: [0, qp.ry, 0]
+                  };
+              }));
+          };
+
+          // Start polling quantum stats for the HUD
+          const statsInterval = setInterval(() => {
+              if (quantumRef.current) {
+                  setQuantumStats(quantumRef.current.getStats());
+              }
+          }, 500);
+
+          quantum.join();
+
+          // Store cleanup ref
+          (socket as any).__quantumStatsInterval = statsInterval;
       });
 
       socket.on('room-state', (state) => {
@@ -2757,6 +2795,61 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
                         <div className="bg-white/5 rounded-lg p-2">
                             <div className="text-[9px] text-gray-500 uppercase tracking-widest">Throughput</div>
                             <div className="text-sm font-black text-white">{infraStats.throughputKbps} KB/s</div>
+                        </div>
+                    </div>
+
+                    {/* ── GlidroviaQuantum Panel ── */}
+                    <div className="border-t border-white/10 pt-3 space-y-2">
+                        <div className="flex items-center justify-between">
+                            <span className="text-[10px] font-black uppercase tracking-widest text-purple-400">GlidroviaQuantum</span>
+                            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${quantumStats?.connected ? 'bg-purple-500/20 text-purple-400' : 'bg-gray-500/20 text-gray-500'}`}>
+                                {quantumStats?.connected ? '30Hz ACTIVO' : 'OFFLINE'}
+                            </span>
+                        </div>
+                        <p className="text-[9px] text-gray-500 leading-tight">
+                            Motor determinista server-autoritative. Inputs a 60Hz · Física 30Hz · Predicción local + reconciliación.
+                        </p>
+                        {quantumStats && (
+                            <div className="grid grid-cols-3 gap-1.5">
+                                <div className="bg-purple-500/10 border border-purple-500/20 rounded-lg p-1.5 text-center">
+                                    <div className="text-[8px] text-purple-400 uppercase">Tick</div>
+                                    <div className="text-xs font-black text-white">{quantumStats.serverTick}</div>
+                                </div>
+                                <div className="bg-purple-500/10 border border-purple-500/20 rounded-lg p-1.5 text-center">
+                                    <div className="text-[8px] text-purple-400 uppercase">Seq</div>
+                                    <div className="text-xs font-black text-white">{quantumStats.inputSeq}</div>
+                                </div>
+                                <div className="bg-purple-500/10 border border-purple-500/20 rounded-lg p-1.5 text-center">
+                                    <div className="text-[8px] text-purple-400 uppercase">Reconcil.</div>
+                                    <div className="text-xs font-black text-white">{quantumStats.reconciliations}</div>
+                                </div>
+                                <div className="bg-purple-500/10 border border-purple-500/20 rounded-lg p-1.5 text-center">
+                                    <div className="text-[8px] text-purple-400 uppercase">Remotos</div>
+                                    <div className="text-xs font-black text-white">{quantumStats.remotePlayers}</div>
+                                </div>
+                                <div className="bg-purple-500/10 border border-purple-500/20 rounded-lg p-1.5 text-center">
+                                    <div className="text-[8px] text-purple-400 uppercase">In</div>
+                                    <div className="text-xs font-black text-white">{quantumStats.packetsIn}</div>
+                                </div>
+                                <div className="bg-purple-500/10 border border-purple-500/20 rounded-lg p-1.5 text-center">
+                                    <div className="text-[8px] text-purple-400 uppercase">Out</div>
+                                    <div className="text-xs font-black text-white">{quantumStats.packetsOut}</div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* SFU Voice Layer */}
+                        <div className="flex items-start gap-2 pt-1">
+                            <div className="mt-0.5 w-2 h-2 rounded-full flex-shrink-0 bg-cyan-400 animate-pulse" />
+                            <div className="flex-1">
+                                <div className="flex items-center justify-between">
+                                    <span className="text-[10px] font-black text-white tracking-widest">SFU VOZ</span>
+                                    <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-cyan-500/20 text-cyan-400">ACTIVO</span>
+                                </div>
+                                <p className="text-[9px] text-gray-500 mt-0.5 leading-tight">
+                                    Selective Forwarding — max 8 speakers/zona · volumen por distancia 3D · rango 40u
+                                </p>
+                            </div>
                         </div>
                     </div>
                 </div>

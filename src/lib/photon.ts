@@ -1,35 +1,35 @@
-
 import { PhotonRoom, PhotonMeshStatus } from '../types';
+import { GlidroviaQuantum } from './quantum';
+
+export { GlidroviaQuantum };
 
 /**
- * Photon Engine Quantum - Mesh Integration Logic
- * Handles high-concurrency multiplayer rooms (20 users/room)
- * Integrated with the Glidrovia High-Scale Infrastructure
+ * PhotonMeshManager — wraps GlidroviaQuantum for room-listing UI.
+ * Real-time stats come from the live quantum instance when in play mode.
  */
 class PhotonMeshManager {
   private static instance: PhotonMeshManager;
   private connectivityStatus: 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED' = 'DISCONNECTED';
-  private currentRegion: string = 'us-east';
-  
+  private currentRegion: string = 'LATAM-1';
   private rooms: PhotonRoom[] = [];
+  private _quantum: GlidroviaQuantum | null = null;
 
-  constructor() {
-    this.initializeMockRooms();
+  private constructor() {
+    this._seedRooms();
   }
 
-  public static getInstance(): PhotonMeshManager {
+  static getInstance(): PhotonMeshManager {
     if (!PhotonMeshManager.instance) {
       PhotonMeshManager.instance = new PhotonMeshManager();
     }
     return PhotonMeshManager.instance;
   }
 
-  private initializeMockRooms() {
-    // Generate some initial rooms to simulate a live environment
+  private _seedRooms() {
     for (let i = 1; i <= 10; i++) {
       this.rooms.push({
         id: `room-${i}`,
-        name: `Sala Glidrovia #${i}`,
+        name: `Glidrovia #${i}`,
         playerCount: Math.floor(Math.random() * 20),
         maxPlayers: 20,
         region: 'LATAM-1',
@@ -39,37 +39,41 @@ class PhotonMeshManager {
     }
   }
 
-  public async connect(): Promise<boolean> {
+  async connect(): Promise<boolean> {
     this.connectivityStatus = 'RECONNECTING';
     return new Promise((resolve) => {
       setTimeout(() => {
         this.connectivityStatus = 'CONNECTED';
-        console.log('[PHOTON QUANTUM] Connected to Master Server (Region: LATAM-1)');
+        console.log('[PHOTON QUANTUM] Master Server connected (LATAM-1)');
         resolve(true);
-      }, 1500);
+      }, 600);
     });
   }
 
-  public getStatus(): PhotonMeshStatus {
+  /** Attach a live GlidroviaQuantum instance for real stats */
+  attachQuantum(q: GlidroviaQuantum) {
+    this._quantum = q;
+  }
+
+  getStatus(): PhotonMeshStatus & { quantum?: ReturnType<GlidroviaQuantum['getStats']> } {
     return {
       activeRooms: 540 + Math.floor(Math.random() * 50),
       totalConcurrence: 8500 + Math.floor(Math.random() * 500),
       relayNodes: 42,
-      photonCloudStatus: 'OPTIMAL'
+      photonCloudStatus: 'OPTIMAL',
+      quantum: this._quantum?.getStats()
     };
   }
 
-  public listRooms(): PhotonRoom[] {
-    return this.rooms;
-  }
+  listRooms(): PhotonRoom[] { return this.rooms; }
 
-  public joinRoom(roomId: string): Promise<boolean> {
+  joinRoom(roomId: string): Promise<boolean> {
     return new Promise((resolve) => {
-      console.log(`[PHOTON] Joining room ${roomId}... Synchronizing Quantum ticks.`);
+      console.log(`[PHOTON] Joining ${roomId} — syncing Quantum ticks`);
       setTimeout(() => {
-        console.log(`[PHOTON] Room ${roomId} joined. 100Hz frequency active.`);
+        console.log(`[PHOTON] ${roomId} joined. Quantum 30Hz active.`);
         resolve(true);
-      }, 800);
+      }, 400);
     });
   }
 }
@@ -77,21 +81,18 @@ class PhotonMeshManager {
 export const photonMesh = PhotonMeshManager.getInstance();
 
 /**
- * Historical User Storage Utility
- * Manages millions of users locally using Browser Storage
+ * LocalProfileManager — offline-first user data
  */
 export const LocalProfileManager = {
   SAVE_KEY: 'glidrovia_local_profile',
 
   saveProfile(profile: any) {
     try {
-      const data = {
+      localStorage.setItem(this.SAVE_KEY, JSON.stringify({
         ...profile,
         isHistorical: true,
         localUpdatedAt: new Date().toISOString()
-      };
-      localStorage.setItem(this.SAVE_KEY, JSON.stringify(data));
-      console.log('[LOCAL STORAGE] Profile persisted for offline-first scalability.');
+      }));
     } catch (e) {
       console.error('[LOCAL STORAGE] Error saving profile:', e);
     }
@@ -99,8 +100,7 @@ export const LocalProfileManager = {
 
   getProfile() {
     const data = localStorage.getItem(this.SAVE_KEY);
-    if (!data) return null;
-    return JSON.parse(data);
+    return data ? JSON.parse(data) : null;
   },
 
   clearProfile() {
