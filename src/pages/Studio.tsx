@@ -19,7 +19,9 @@ import { dataService } from '../lib/dataService';
 import { playFab } from '../lib/playfab';
 import { sessionManager } from '../lib/session';
 import { getSupabaseClient, isSupabaseEnabled } from '../lib/supabase';
-import { GraphicsEngine } from '../components/GraphicsEngine';
+import { GraphicsEngine, FPSAdapter, HighEndEnvironment } from '../components/GraphicsEngine';
+import { GraphicsPanel, FPSCounter } from '../components/GraphicsPanel';
+import { GraphicsProvider, useGraphics } from '../lib/graphicsContext';
 import { hybridMesh, ICE_SERVERS, getInfraLayers } from '../lib/meshNetwork';
 import { GlidroviaQuantum } from '../lib/quantum';
 
@@ -3061,6 +3063,7 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
 
 
   return (
+    <GraphicsProvider initial="balanced">
     <div className="flex flex-col h-screen w-screen bg-[#232527] overflow-hidden text-white font-sans relative">
       
       {loadingStep > 0 && !isPlaying && (
@@ -3078,6 +3081,9 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
       
       {isPlaying && <SpecialEffects objects={objects} />}
       {isPlaying && <GameControls />}
+
+      {/* GRAPHICS PANEL — studio only, top-right */}
+      {!isPlaying && <GraphicsPanel isPlaying={isPlaying} />}
 
       {/* MULTIPLAYER STATUS OVERLAY */}
       <div className="absolute bottom-4 left-4 z-50 flex flex-col gap-1 pointer-events-none">
@@ -3518,51 +3524,45 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
 
       <div className="flex-1 flex overflow-hidden">
         <div className="flex-1 bg-[#0a0b0d] relative overflow-hidden">
-           <Canvas 
-            shadows 
-            dpr={[1, 2]} 
+           <Canvas
+            shadows
+            dpr={isPlaying ? [0.8, 1.5] : [1, 2]}
             camera={{ position: [30, 30, 30], fov: 45 }}
-            performance={{ min: 0.5 }}
-            gl={{ 
-                antialias: false, 
+            performance={{ min: 0.4 }}
+            gl={{
+                antialias: false,
                 powerPreference: "high-performance",
                 stencil: false,
-                depth: true
+                depth: true,
+                logarithmicDepthBuffer: true,
             }}
            >
               <ErrorBoundary fallback={<gridHelper args={[100, 100, 0xff0000, 0x444444]} />}>
                  {!isPlaying && <OrbitControls makeDefault minDistance={5} maxDistance={500} />}
-                 <ambientLight intensity={0.5} />
-                 <directionalLight 
-                    position={[100, 150, 100]} 
-                    intensity={2.5} 
-                    castShadow 
-                    shadow-mapSize={[2048, 2048]}
-                    shadow-bias={-0.0001}
-                    shadow-camera-left={-200}
-                    shadow-camera-right={200}
-                    shadow-camera-top={200}
-                    shadow-camera-bottom={-200}
-                    shadow-camera-near={1}
-                    shadow-camera-far={1000}
-                  />
-                  <hemisphereLight intensity={0.4} color="#ffffff" groundColor="#444444" />
-                  <Environment preset={SKYBOXES[skybox as keyof typeof SKYBOXES]?.environment as any || "city"} />
-                  <ContactShadows position={[0, -0.02, 0]} opacity={0.65} scale={150} blur={2.8} far={20} />
-                 
-                 <Sky 
-                    sunPosition={SKYBOXES[skybox as keyof typeof SKYBOXES]?.sunPosition as any || [100, 20, 100]} 
-                    turbidity={skybox === 'Sunset' ? 10 : 1} 
-                    rayleigh={skybox === 'Sunset' ? 6 : 2} 
+
+                 {/* LUXEN lighting rig */}
+                 <HighEndEnvironment />
+                 <ambientLight intensity={0.3} />
+
+                 {/* Environment & sky */}
+                 <Environment preset={SKYBOXES[skybox as keyof typeof SKYBOXES]?.environment as any || "city"} />
+                 <ContactShadows position={[0, -0.02, 0]} opacity={0.55} scale={150} blur={3} far={20} />
+                 <Sky
+                    sunPosition={SKYBOXES[skybox as keyof typeof SKYBOXES]?.sunPosition as any || [100, 20, 100]}
+                    turbidity={skybox === 'Sunset' ? 10 : 1}
+                    rayleigh={skybox === 'Sunset' ? 6 : 2}
                     mieCoefficient={0.005}
                     mieDirectionalG={0.8}
                   />
                   {SKYBOXES[skybox as keyof typeof SKYBOXES]?.stars && <Stars radius={150} depth={50} count={7000} factor={6} saturation={0.5} fade speed={1.5} />}
-                  <fog attach="fog" args={[SKYBOXES[skybox as keyof typeof SKYBOXES]?.fog || '#000000', 10, 300]} />
-                  
+
+                  {/* GLIDROVIA GRAPHICS ENGINE — LUXEN + NANO */}
                   <Suspense fallback={null}>
                     <GraphicsEngine />
                   </Suspense>
+                  {/* FPS monitor + auto-adapt */}
+                  <FPSCounter />
+                  <FPSAdapter />
                   
                   {isPlaying && activeCinematicIndex !== null && (
                       <CinematicCamera objects={objects} index={activeCinematicIndex} isPlaying={isPlaying} />
@@ -4192,5 +4192,6 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
         )}
       </div>
     </div>
+    </GraphicsProvider>
   );
 };
