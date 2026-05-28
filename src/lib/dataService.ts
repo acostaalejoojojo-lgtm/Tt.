@@ -257,83 +257,49 @@ export const dataService = {
 
   // --- UPLOADS ---
   async uploadFile(file: File): Promise<string> {
-    const supabase = getSupabaseClient();
-    if (isSupabaseEnabled() && supabase) {
-      const fileExt = file.name.split('.').pop();
-      const fileName = `${Math.random()}.${fileExt}`;
-      const filePath = `uploads/${fileName}`;
+    // ── Definitive local upload with automatic retry ──────────────────────────
+    // Supabase Storage is not used here: it requires manually created buckets
+    // which don't exist, causing 7 consecutive failed requests before giving up.
+    // All files are stored on the server under /uploads/ which is served with
+    // 1-year immutable caching, so performance is excellent after first load.
+    //
+    // Retry strategy: 3 attempts with 1 s delay, handles momentary server hiccups.
+    const MAX_RETRIES = 3;
+    let lastError: Error | null = null;
 
-      // Intentamos con varios nombres comunes de buckets
-      const bucketsToTry = ['assets', 'asset', 'images', 'image', 'pictures', 'storage', 'public'];
-      
-      let uploadError = null;
-      let lastBucket = '';
-
-      for (const bucketName of bucketsToTry) {
-        try {
-          const { error } = await supabase.storage
-            .from(bucketName)
-            .upload(filePath, file);
-          
-          if (!error) {
-            const { data } = supabase.storage
-              .from(bucketName)
-              .getPublicUrl(filePath);
-            return data.publicUrl;
-          }
-          
-          uploadError = error;
-          lastBucket = bucketName;
-          
-          // Si el error no es "not found", paramos de intentar otros buckets (puede ser otro problema real)
-          if (!error.message?.includes('not found')) {
-             break;
-          }
-        } catch (err: any) {
-          uploadError = err;
-          // Continue to next bucket
-        }
-      }
-
-      console.error(`Error uploading to Supabase Storage in bucket ${lastBucket}:`, uploadError);
-      
-      // Fallback a la API local si falla Supabase por bucket o similar
-      console.log('Falling back to local API upload due to Supabase error...');
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
         const formData = new FormData();
         formData.append('file', file);
+
         const res = await fetch('/api/upload', {
           method: 'POST',
-          body: formData
+          body: formData,
         });
+
         if (!res.ok) {
-           const text = await res.text();
-           throw new Error(text || 'Local upload fallback failed');
+          const text = await res.text();
+          throw new Error(text || `Error del servidor (${res.status})`);
         }
+
         const data = await res.json();
+        if (!data.url) throw new Error('El servidor no devolvió una URL');
         return data.url;
-      } catch (fallbackErr: any) {
-        console.error('Local fallback failed:', fallbackErr);
-        // Prioritize the fallback error if Supabase failed with "Bucket not found"
-        if (uploadError && uploadError.message?.includes('not found')) {
-            throw fallbackErr;
+
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`[UPLOAD] Intento ${attempt}/${MAX_RETRIES} fallido:`, err.message);
+        if (attempt < MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, 1000 * attempt)); // 1s, 2s
         }
-        throw uploadError || fallbackErr;
       }
-    } else {
-      const formData = new FormData();
-      formData.append('file', file);
-      const res = await fetch('/api/upload', {
-        method: 'POST',
-        body: formData
-      });
-      if (!res.ok) {
-         const text = await res.text();
-         throw new Error(text || 'Upload failed');
-      }
-      const data = await res.json();
-      return data.url;
     }
+
+    throw new Error(
+      lastError?.message?.includes('413')
+        ? 'El archivo es demasiado grande (máximo 200 MB)'
+        : `No se pudo subir el archivo después de ${MAX_RETRIES} intentos. Comprueba tu conexión.`
+    );
   },
 
   async searchUsers(query: string): Promise<any[]> {
