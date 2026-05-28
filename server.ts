@@ -480,13 +480,14 @@ async function startServer() {
     cors: { origin: "*", methods: ["GET", "POST"] },
     transports: ['websocket', 'polling'],
     // ── High-concurrency tuning ──────────────────────────────────────────
-    maxHttpBufferSize: 1e6,          // 1 MB max message (enough for state)
-    pingTimeout: 20000,              // 20 s before considering a dead conn
-    pingInterval: 10000,             // probe every 10 s
-    upgradeTimeout: 10000,
+    maxHttpBufferSize: 1e6,          // 1 MB max message
+    pingTimeout: 30000,              // 30 s — gives more time before dropping
+    pingInterval: 25000,             // probe every 25 s — far less reconnect storm
+    upgradeTimeout: 15000,           // more time to upgrade from polling→ws
+    connectTimeout: 20000,           // time to complete handshake
     allowUpgrades: true,
-    perMessageDeflate: {             // WebSocket per-frame compression
-      threshold: 128,               // compress frames >128 bytes
+    perMessageDeflate: {
+      threshold: 128,
       zlibDeflateOptions: { level: 6 },
       zlibInflateOptions: { chunkSize: 10 * 1024 }
     }
@@ -534,8 +535,21 @@ async function startServer() {
     }
   });
 
-  // API Routes
-  app.use("/uploads", express.static(UPLOADS_DIR));
+  // ── Static assets — uploads served with long-term caching ────────────────
+  // Uploaded models (GLB/FBX) and images never change once uploaded,
+  // so we can safely cache them for 1 year. This eliminates re-downloads.
+  app.use("/uploads", express.static(UPLOADS_DIR, {
+    maxAge: '365d',
+    immutable: true,
+    etag: true,
+    lastModified: true,
+    setHeaders: (res, filePath) => {
+      // Allow cross-origin loads (needed for Three.js texture loads)
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      // Tell browsers to cache aggressively
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    }
+  }));
 
   app.get("/api/health", (req, res) => {
     const status = clusterManager.getGlobalStatus();
@@ -629,6 +643,7 @@ async function startServer() {
   });
 
   app.get("/api/games", async (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=10, stale-while-revalidate=30');
     const games = await DataService.getGames();
     res.json(games);
   });
@@ -895,6 +910,7 @@ async function startServer() {
   });
 
   app.get("/api/global-settings", async (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
     const settings = await DataService.getGlobalSettings();
     res.json(settings);
   });
@@ -952,6 +968,7 @@ async function startServer() {
   });
   
   app.get("/api/regions", async (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
     const db = await readDB();
     res.json(db.regions || []);
   });
@@ -1492,15 +1509,21 @@ async function startServer() {
         }
       }
 
-      // Clean up Quantum rooms on disconnect
+      // Clean up Quantum rooms on disconnect — with 15s grace period
+      // This prevents rapid create/destroy cycles when clients reconnect
       qRooms.forEach((qRoom, roomId) => {
         if (qRoom.players.has(socket.id)) {
           qRoom.players.delete(socket.id);
           qRoom.inputs.delete(socket.id);
-          console.log(`[QUANTUM] Player ${socket.id} left room ${roomId} (${qRoom.players.size} remaining)`);
           if (qRoom.players.size === 0) {
-            qRooms.delete(roomId);
-            console.log(`[QUANTUM] Room ${roomId} closed — no players`);
+            // Wait 15 seconds before closing — client may reconnect
+            setTimeout(() => {
+              const room = qRooms.get(roomId);
+              if (room && room.players.size === 0) {
+                qRooms.delete(roomId);
+                console.log(`[QUANTUM] Room ${roomId} closed after grace period`);
+              }
+            }, 15000);
           }
         }
       });

@@ -69,6 +69,53 @@ export const ModelGLTFInternal = ({ url, isPlaying, selectedAnimation, onAnimati
   return <primitive object={clone} />;
 };
 
+// ── Module-level URL validation cache ────────────────────────────────────────
+// Stores results of HEAD checks so the same URL is never double-checked.
+// 'ok' = verified good, 'err:<msg>' = known bad, undefined = not checked yet
+const urlValidationCache = new Map<string, string>();
+
+// Fast header-only check: uses Range to fetch only the first 4 bytes.
+// This avoids downloading the entire model just to validate it.
+async function fastValidateModelUrl(url: string): Promise<string | null> {
+  const cached = urlValidationCache.get(url);
+  if (cached) return cached === 'ok' ? null : cached.slice(4); // strip 'err:'
+
+  try {
+    // First: HEAD to check existence and content-type (0 bytes downloaded)
+    const head = await fetch(url, { method: 'HEAD' });
+    if (!head.ok) {
+      const msg = `El archivo no existe (${head.status})`;
+      urlValidationCache.set(url, 'err:' + msg);
+      return msg;
+    }
+    const ct = head.headers.get('Content-Type') || '';
+    if (ct.includes('text/html')) {
+      const msg = 'El servidor devolvió HTML en lugar de un modelo 3D';
+      urlValidationCache.set(url, 'err:' + msg);
+      return msg;
+    }
+
+    // Second: Range request — fetch only first 4 bytes to check binary header
+    if (url.toLowerCase().endsWith('.glb')) {
+      const range = await fetch(url, { headers: { Range: 'bytes=0-3' } });
+      const buf = await range.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const header = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+      if (header !== 'glTF') {
+        const msg = 'El GLB está corrupto (cabecera inválida)';
+        urlValidationCache.set(url, 'err:' + msg);
+        return msg;
+      }
+    }
+
+    urlValidationCache.set(url, 'ok');
+    return null;
+  } catch {
+    // Network error — don't cache, allow retry
+    return 'Error de red al verificar el modelo';
+  }
+}
+
 export const ModelGLTF = ({ url, isPlaying, selectedAnimation, onAnimationsLoaded, targetHeight = 3 }: { 
     url: string; 
     isPlaying?: boolean; 
@@ -77,73 +124,36 @@ export const ModelGLTF = ({ url, isPlaying, selectedAnimation, onAnimationsLoade
     targetHeight?: number;
   }) => {
     const [error, setError] = useState<string | null>(null);
-    const [isVerified, setIsVerified] = useState(false);
-  
+    const [isVerified, setIsVerified] = useState(() => urlValidationCache.get(url) === 'ok');
+
     useEffect(() => {
-      let isMounted = true;
-      const checkUrl = async () => {
-        if (!url) return;
-        try {
-          // Use fetch to check if the file exists and is not an HTML error page
-          // Also check for binary header if it's a small fetch to avoid "PK" (ZIP) issues with GLTF JSON loader
-          const response = await fetch(url);
-          if (!isMounted) return;
-
-          if (!response.ok) {
-            setError(`Error: El archivo no existe (${response.status})`);
-            return;
-          }
-
-          const contentType = response.headers.get('Content-Type');
-          if (contentType && contentType.includes('text/html')) {
-            setError("Error: El servidor devolvió HTML en lugar de un modelo 3D");
-            return;
-          }
-
-          // Peek at start of file for "PK" (ZIP/corrupted) or "glTF"
-          const reader = response.body?.getReader();
-          if (reader) {
-             const { value } = await reader.read();
-             if (value && value.length >= 2) {
-                const header = String.fromCharCode(value[0], value[1]);
-                if (header === 'PK' || url.toLowerCase().endsWith('.zip')) {
-                   setError("Error: El archivo es un ZIP o está comprimido. Por favor usa un archivo .glb o .gltf directo.");
-                   return;
-                }
-                
-                if (url.toLowerCase().endsWith('.glb')) {
-                   const gltfHeader = String.fromCharCode(value[0], value[1], value[2], value[3]);
-                   if (gltfHeader !== 'glTF') {
-                      setError("Error: El archivo GLB parece estar corrupto (Cabecera glTF no encontrada)");
-                      return;
-                   }
-                }
-             }
-             reader.releaseLock();
-          }
-
-          setIsVerified(true);
-        } catch (e) {
-          if (isMounted) setError("Error de red al cargar el modelo");
-        }
-      };
-      
+      if (!url) return;
+      // Already verified this session — skip network check entirely
+      if (urlValidationCache.get(url) === 'ok') {
+        setIsVerified(true);
+        setError(null);
+        return;
+      }
+      let cancelled = false;
       setIsVerified(false);
       setError(null);
-      checkUrl();
-      
-      return () => { isMounted = false; };
+
+      fastValidateModelUrl(url).then(err => {
+        if (cancelled) return;
+        if (err) setError(err);
+        else setIsVerified(true);
+      });
+
+      return () => { cancelled = true; };
     }, [url]);
-  
+
     if (error) {
       return (
         <group>
-          {/* Torso */}
           <mesh position={[0, 1, 0]}>
             <boxGeometry args={[1, 1.2, 0.5]} />
             <meshStandardMaterial color="#0047AB" />
           </mesh>
-          {/* Head */}
           <mesh position={[0, 1.9, 0]}>
             <boxGeometry args={[0.8, 0.8, 0.8]} />
             <meshStandardMaterial color="#FFFFFF" />
@@ -152,10 +162,8 @@ export const ModelGLTF = ({ url, isPlaying, selectedAnimation, onAnimationsLoade
               <meshBasicMaterial color="black" transparent opacity={0.6} />
             </mesh>
           </mesh>
-          {/* Arms */}
           <mesh position={[-0.75, 1.1, 0]}><boxGeometry args={[0.5, 1, 0.5]} /><meshStandardMaterial color="#F5CD30" /></mesh>
           <mesh position={[0.75, 1.1, 0]}><boxGeometry args={[0.5, 1, 0.5]} /><meshStandardMaterial color="#F5CD30" /></mesh>
-          {/* Legs */}
           <mesh position={[-0.25, 0.35, 0]}><boxGeometry args={[0.45, 0.7, 0.5]} /><meshStandardMaterial color="#A2C429" /></mesh>
           <mesh position={[0.25, 0.35, 0]}><boxGeometry args={[0.45, 0.7, 0.5]} /><meshStandardMaterial color="#A2C429" /></mesh>
         </group>

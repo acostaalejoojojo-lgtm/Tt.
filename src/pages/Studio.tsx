@@ -2230,8 +2230,16 @@ export const StudioPage: React.FC<StudioProps> = ({ onPublish, avatarConfig, ini
           setObjects(prev => prev.map(obj => obj.id === id ? { ...obj, ...newProps } : obj));
       };
       
-      // Connect to real-time server
-      const socket = io();
+      // Connect to real-time server — backoff reconnection to prevent storm
+      const socket = io({
+        reconnection: true,
+        reconnectionAttempts: 10,
+        reconnectionDelay: 1500,        // wait 1.5s before first retry
+        reconnectionDelayMax: 15000,    // cap at 15s between retries
+        randomizationFactor: 0.4,       // ±40% jitter to spread reconnects
+        timeout: 20000,
+        transports: ['websocket', 'polling'],
+      });
       socketRef.current = socket;
       (window as any).studioSocket = socket;
       
