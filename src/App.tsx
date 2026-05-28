@@ -437,7 +437,15 @@ function App() {
   }, [isAuthenticated, user?.username, user?.level, socket]);
 
   useEffect(() => {
-    const s = io();
+    const s = io({
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1500,
+      reconnectionDelayMax: 15000,
+      randomizationFactor: 0.4,
+      timeout: 20000,
+      transports: ['websocket', 'polling'],
+    });
     setSocket(s);
 
     s.on("game-published", (newGame: Game) => {
@@ -699,8 +707,19 @@ function App() {
     }
   };
 
+  // Guard: prevents two concurrent login calls (double-restore race condition)
+  const loginInProgressRef = React.useRef(false);
+
   const handleLogin = async (username: string, password?: string) => {
     if (!username || !username.trim()) return;
+    // If a login is already in flight, ignore the duplicate call.
+    // This happens because Firebase onAuthStateChanged fires "no user" ~500ms
+    // after mount, causing a second handleLogin() alongside the localStorage one.
+    if (loginInProgressRef.current) {
+      console.log(`[SESSION] Login already in progress, ignoring duplicate call for ${username}`);
+      return;
+    }
+    loginInProgressRef.current = true;
     try {
         console.log(`[SESSION] Initializing session for: ${username}`);
         
@@ -733,13 +752,15 @@ function App() {
         console.log(`[SESSION] Node established for ${username}`);
     } catch (err) {
         console.error("Login session failed:", err);
-        // Retry logic for extreme scale
         if (username !== 'Invitado') {
            handleHistoricalLogin(username);
            alert("Conexión lenta: Iniciando en modo Clúster Histórico Protegido.");
         } else {
            alert("Error de sesión. Por favor, verifica tu conexión.");
         }
+    } finally {
+        // Always release the guard so future manual logins work normally
+        loginInProgressRef.current = false;
     }
   };
 
