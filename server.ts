@@ -452,7 +452,9 @@ async function startServer() {
 
   const authLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 100, // Increased for testing and high-frequency sessions
+    max: 300, // 300 logins/min — handles daily restart burst when all users reconnect
+    standardHeaders: true,
+    legacyHeaders: false,
   });
 
   app.use("/api/", apiLimiter);
@@ -783,9 +785,18 @@ async function startServer() {
     res.json({ success: true, friends: user.friends });
   });
 
+  // ── In-memory login cache ─────────────────────────────────────────────────
+  // When the server restarts and all users reconnect at the same time, this
+  // cache absorbs the burst: the first request for each user hits the DB,
+  // subsequent requests within the TTL are served instantly from memory.
+  const loginCache = new Map<string, { user: any; expiresAt: number }>();
+  const LOGIN_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+  // Call this whenever user data changes so the cache doesn't serve stale data
+  const invalidateLoginCache = (username: string) => loginCache.delete(username.toLowerCase().trim());
+
   app.post("/api/login", async (req, res) => {
     try {
-      console.log("[API] Login request:", req.body?.username);
       const { username, password } = req.body;
       
       if (!username) {
@@ -793,6 +804,13 @@ async function startServer() {
       }
 
       const normalizedUsername = username.toLowerCase().trim();
+
+      // Serve from cache if available (skip DB read for repeat session restores)
+      const cached = loginCache.get(normalizedUsername);
+      if (cached && cached.expiresAt > Date.now()) {
+        return res.json(cached.user);
+      }
+
       let user = await DataService.getUser(normalizedUsername);
 
       // Official Account Logic (Master Admin)
@@ -843,6 +861,8 @@ async function startServer() {
           user.avatarConfig.customAnimations = DEFAULT_AVATAR_CONFIG.customAnimations;
         }
       }
+      // Store in cache — next restore request for this user skips DB entirely
+      loginCache.set(normalizedUsername, { user, expiresAt: Date.now() + LOGIN_CACHE_TTL });
       res.json(user);
     } catch (err) {
       console.error("Login catch error:", err);

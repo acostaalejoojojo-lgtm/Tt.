@@ -594,7 +594,40 @@ function App() {
         if (historicalProfile.settings) setSettings(historicalProfile.settings);
     } else if (storedUser) {
         const parsedUser = JSON.parse(storedUser);
-        handleLogin(parsedUser.username);
+
+        // ── Fast offline restore ──────────────────────────────────────────────
+        // If the cached session data includes a full user object (saved on last
+        // successful login) and it's less than 8 hours old, restore it instantly
+        // from localStorage without making a server call. This eliminates the
+        // login avalanche when the server restarts and all users open the app
+        // at the same time. A background verification still runs afterward.
+        const cachedFull = localStorage.getItem('glidroviaUserFull');
+        const cachedAt   = parseInt(localStorage.getItem('glidroviaUserCachedAt') || '0', 10);
+        const eightHours = 8 * 60 * 60 * 1000;
+        const isRecent   = Date.now() - cachedAt < eightHours;
+
+        if (cachedFull && isRecent) {
+            try {
+                const cachedUser = JSON.parse(cachedFull);
+                // Instant restore — user sees their account immediately
+                setUser(cachedUser);
+                setIsAuthenticated(true);
+                if (cachedUser.avatarConfig) setAvatarConfig(cachedUser.avatarConfig);
+                if (cachedUser.settings) setSettings(cachedUser.settings);
+                // Soft background sync — random 1-5 s delay spreads the server
+                // load across time instead of everyone hitting at second 0.
+                const jitter = 1000 + Math.random() * 4000;
+                setTimeout(() => handleLogin(parsedUser.username), jitter);
+            } catch {
+                // Corrupted cache — fall through to normal login
+                handleLogin(parsedUser.username);
+            }
+        } else {
+            // No recent cache — small random delay (0-2 s) still helps spread
+            // concurrent restores when many users open the app simultaneously.
+            const jitter = Math.random() * 2000;
+            setTimeout(() => handleLogin(parsedUser.username), jitter);
+        }
     }
 
     return () => {
@@ -744,6 +777,9 @@ function App() {
         
         localStorage.setItem('glidroviaUser', JSON.stringify({ username: userData.username }));
         localStorage.setItem('glidroviaUid', userData.uid);
+        // Save full user snapshot for fast offline restore on next load
+        localStorage.setItem('glidroviaUserFull', JSON.stringify(userData));
+        localStorage.setItem('glidroviaUserCachedAt', String(Date.now()));
         setIsAuthenticated(true);
 
         if (socket) {
